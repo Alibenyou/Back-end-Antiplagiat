@@ -37,7 +37,7 @@ import os
 HF_TOKEN = os.environ.get("HF_TOKEN")
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-def calculate_similarity(text1, text2):
+def calculate_similarity(text1, text2, retries=2):
     payload = {
         "inputs": {
             "source_sentence": text1,
@@ -45,14 +45,14 @@ def calculate_similarity(text1, text2):
         }
     }
     
-    # On ajoute le Token dans les headers pour s'identifier
     headers = {
         "Authorization": f"Bearer {HF_TOKEN}",
-        "x-wait-for-model": "true"
+        "x-wait-for-model": "true" # Indispensable pour réveiller le modèle
     }
     
     try:
-        response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=20)
+        # On passe le timeout à 60 secondes pour laisser le temps à l'IA de charger
+        response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=60)
         
         if response.status_code != 200:
             print(f"Erreur Router ({response.status_code}): {response.text}")
@@ -61,6 +61,13 @@ def calculate_similarity(text1, text2):
         result = response.json()
         if isinstance(result, list) and len(result) > 0:
             return float(result[0])
+        return 0
+
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        if retries > 0:
+            print(f"L'IA est lente à répondre, nouvel essai... ({retries} restants)")
+            time.sleep(5)
+            return calculate_similarity(text1, text2, retries - 1)
         return 0
     except Exception as e:
         print(f"Erreur technique : {e}")
