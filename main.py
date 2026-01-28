@@ -33,7 +33,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 def calculate_similarity(text1, text2):
-    """ Envoie les deux textes à Hugging Face pour comparer leur similarité """
+    """ Envoie les textes à Hugging Face avec gestion du temps de chargement """
     try:
         payload = {
             "inputs": {
@@ -41,15 +41,28 @@ def calculate_similarity(text1, text2):
                 "sentences": [text2]
             }
         }
-        response = requests.post(HF_API_URL, json=payload, timeout=20)
-        # Si le modèle dort, Hugging Face renvoie un message d'attente
-        if response.status_code == 503:
-            time.sleep(5) # On attend 5s et on réessaie
-            return calculate_similarity(text1, text2)
+        # On ajoute un Header pour forcer l'attente du modèle
+        headers = {"x-use-cache": "false", "x-wait-for-model": "true"}
         
-        return response.json()[0] # Retourne le score entre 0 et 1
+        response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=30)
+        result = response.json()
+
+        # Debug: on affiche ce que l'IA répond vraiment dans les logs
+        print(f"DEBUG IA response: {result}")
+
+        # Si Hugging Face renvoie une erreur de chargement
+        if isinstance(result, dict) and "error" in result:
+            print("L'IA charge encore... on attend 10s")
+            time.sleep(10)
+            return calculate_similarity(text1, text2)
+
+        # Extraction du score (Hugging Face renvoie souvent une liste [0.85])
+        if isinstance(result, list) and len(result) > 0:
+            return float(result[0])
+        
+        return 0
     except Exception as e:
-        print(f"Erreur IA : {e}")
+        print(f"Erreur IA critique : {e}")
         return 0
 
 # --- Fonctions Utilitaires ---
