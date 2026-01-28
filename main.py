@@ -32,35 +32,32 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 # On utilise le même modèle mais hébergé chez Hugging Face
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-def calculate_similarity(text1, text2, retries=3):
-    try:
-        payload = {
-            "inputs": {
-                "source_sentence": text1,
-                "sentences": [text2]
-            }
+def calculate_similarity(text1, text2):
+    # On utilise l'URL directe qui est souvent plus stable que le router pour ce modèle
+    API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    
+    payload = {
+        "inputs": {
+            "source_sentence": text1,
+            "sentences": [text2]
         }
-        headers = {"x-use-cache": "false", "x-wait-for-model": "true"}
+    }
+    
+    try:
+        # On force l'attente pour que le modèle se charge
+        response = requests.post(API_URL, json=payload, headers={"x-wait-for-model": "true"}, timeout=20)
         
-        response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=30)
+        # Si la réponse n'est pas 200 (OK), on affiche l'erreur pour comprendre
+        if response.status_code != 200:
+            print(f"Erreur API ({response.status_code}): {response.text}")
+            return 0
+            
         result = response.json()
-
-        print(f"DEBUG IA response: {result}")
-
-        if isinstance(result, dict) and "error" in result:
-            if retries > 0:
-                print(f"L'IA charge ou erreur rencontrée. Essais restants: {retries}")
-                time.sleep(10)
-                return calculate_similarity(text1, text2, retries - 1)
-            else:
-                return 0
-
         if isinstance(result, list) and len(result) > 0:
             return float(result[0])
-        
         return 0
     except Exception as e:
-        print(f"Erreur IA critique : {e}")
+        print(f"Erreur de connexion IA : {e}")
         return 0
 
 # --- Fonctions Utilitaires ---
