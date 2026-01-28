@@ -30,12 +30,14 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
 # --- Configuration IA via API ---
 # On utilise le même modèle mais hébergé chez Hugging Face
+
+import os
+
+# On récupère le token depuis les variables d'environnement de Render
+HF_TOKEN = os.environ.get("HF_TOKEN")
 HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 def calculate_similarity(text1, text2):
-    # On utilise l'URL directe qui est souvent plus stable que le router pour ce modèle
-    API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    
     payload = {
         "inputs": {
             "source_sentence": text1,
@@ -43,13 +45,17 @@ def calculate_similarity(text1, text2):
         }
     }
     
+    # On ajoute le Token dans les headers pour s'identifier
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "x-wait-for-model": "true"
+    }
+    
     try:
-        # On force l'attente pour que le modèle se charge
-        response = requests.post(API_URL, json=payload, headers={"x-wait-for-model": "true"}, timeout=20)
+        response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=20)
         
-        # Si la réponse n'est pas 200 (OK), on affiche l'erreur pour comprendre
         if response.status_code != 200:
-            print(f"Erreur API ({response.status_code}): {response.text}")
+            print(f"Erreur Router ({response.status_code}): {response.text}")
             return 0
             
         result = response.json()
@@ -57,7 +63,7 @@ def calculate_similarity(text1, text2):
             return float(result[0])
         return 0
     except Exception as e:
-        print(f"Erreur de connexion IA : {e}")
+        print(f"Erreur technique : {e}")
         return 0
 
 # --- Fonctions Utilitaires ---
