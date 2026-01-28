@@ -38,7 +38,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
 # 3. Chargement du modèle NLP
 print("Chargement de l'IA (Hugging Face)...")
-model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+model = SentenceTransformer('all-MiniLM-L6-v2')
 print("Système prêt !")
 
 # --- Fonctions Utilitaires ---
