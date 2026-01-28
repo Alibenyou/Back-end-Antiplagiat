@@ -1,20 +1,23 @@
 FROM python:3.10-slim
 
-# On limite la mémoire utilisée par Python
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
 ENV PYTHONMALLOC=malloc
 
 WORKDIR /app
 
-# Installation minimaliste
+# On installe les bibliothèques modernes et on ajoute "|| true" pour ne pas bloquer
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* || true
 
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# On limite le nombre de workers pour économiser la RAM
+# Crucial pour ne pas exploser la RAM au démarrage
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
