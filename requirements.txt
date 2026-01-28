@@ -4,6 +4,4 @@ python-dotenv
 requests
 beautifulsoup4
 pymupdf
-sentence-transformers
 supabase
-torch --index-url https://download.pytorch.org/whl/cpu

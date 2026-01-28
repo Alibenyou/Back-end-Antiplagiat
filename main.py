@@ -1,19 +1,17 @@
 import os
 import fitz  # PyMuPDF
 import requests
+import time
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer, util
 from supabase import create_client, Client, ClientOptions
 from dotenv import load_dotenv
 
-# Charger les variables d'environnement
 load_dotenv()
 
 app = FastAPI()
 
-# 1. Configuration CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,24 +20,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Configuration Supabase (Initialisation UNIQUE et ROBUSTE)
+# Configuration Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
-# On définit les options de timeout pour éviter les déconnexions
-opts = ClientOptions(
-    postgrest_client_timeout=60, # 1 minute
-    storage_client_timeout=60
-)
-
-# UNE SEULE INITIALISATION ICI
+opts = ClientOptions(postgrest_client_timeout=60, storage_client_timeout=60)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
-# 3. Chargement du modèle NLP
-print("Chargement de l'IA (Hugging Face)...")
-model = SentenceTransformer('all-MiniLM-L6-v2')
-print("Système prêt !")
+# --- Configuration IA via API ---
+# On utilise le même modèle mais hébergé chez Hugging Face
+HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+def calculate_similarity(text1, text2):
+    """ Envoie les deux textes à Hugging Face pour comparer leur similarité """
+    try:
+        payload = {
+            "inputs": {
+                "source_sentence": text1,
+                "sentences": [text2]
+            }
+        }
+        response = requests.post(HF_API_URL, json=payload, timeout=20)
+        # Si le modèle dort, Hugging Face renvoie un message d'attente
+        if response.status_code == 503:
+            time.sleep(5) # On attend 5s et on réessaie
+            return calculate_similarity(text1, text2)
+        
+        return response.json()[0] # Retourne le score entre 0 et 1
+    except Exception as e:
+        print(f"Erreur IA : {e}")
+        return 0
 
 # --- Fonctions Utilitaires ---
 
@@ -50,33 +61,32 @@ def extract_text(file_content):
             for page in doc:
                 text += page.get_text()
     except Exception as e:
-        print(f"Erreur extraction PDF : {e}")
+        print(f"Erreur PDF : {e}")
     return text
 
 def search_google(query):
     headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
-    payload = {"q": query, "num": 5}
+    payload = {"q": query, "num": 3} # Limité à 3 pour la rapidité
     try:
         response = requests.post("https://google.serper.dev/search", headers=headers, json=payload, timeout=10)
         return response.json().get('organic', [])
-    except Exception as e:
-        print(f"Erreur recherche Google : {e}")
+    except:
         return []
 
 def scrape_website(url):
     try:
-        res = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
+        res = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
         soup = BeautifulSoup(res.text, 'html.parser')
         paragraphs = [p.get_text() for p in soup.find_all('p')]
-        return " ".join(paragraphs)
+        return " ".join(paragraphs)[:2000] # On limite le texte récupéré
     except:
         return ""
 
-# --- La Logique d'Analyse ---
+# --- Logique d'Analyse ---
 
 async def process_analysis(analysis_id: str, file_path: str):
     try:
-        # On tente de retélécharger si échec
+        # 1. Récupération du fichier
         file_bin = supabase.storage.from_('fichiers_plagiat').download(file_path)
         user_text = extract_text(file_bin)
         
@@ -84,7 +94,7 @@ async def process_analysis(analysis_id: str, file_path: str):
             supabase.table("analyses").update({"status": "termine", "plagiarism_score": 0}).eq("id", analysis_id).execute()
             return
 
-        emb_user = model.encode(user_text, convert_to_tensor=True)
+        # 2. Recherche Web
         search_query = user_text[:300] 
         web_sources = search_google(search_query)
 
@@ -93,58 +103,42 @@ async def process_analysis(analysis_id: str, file_path: str):
             link = source['link']
             web_text = scrape_website(link)
 
-            if web_text and len(web_text.strip()) > 100:
-                emb_web = model.encode(web_text, convert_to_tensor=True)
-                similarity = util.cos_sim(emb_user, emb_web).item()
+            if web_text:
+                # 3. Comparaison via API Hugging Face
+                similarity = calculate_similarity(user_text[:1000], web_text[:1000])
                 score = round(similarity * 100, 2)
                 
                 if score > max_score:
                     max_score = score
 
                 if score > 15:
-                    # Envoi individuel
                     supabase.table("analysis_results").insert({
                         "analysis_id": analysis_id,
                         "url": link,
                         "title": source.get('title'),
-                        "similarity_score": score,
-                        "matching_text": web_text[:500]
+                        "similarity_score": score
                     }).execute()
         
-        # F. Signal de fin
-        print(f"✅ Analyse {analysis_id} terminée. Score : {max_score}%")
+        # 4. Finalisation
         supabase.table("analyses").update({
             "status": "termine",
             "plagiarism_score": max_score
         }).eq("id", analysis_id).execute()
 
     except Exception as e:
-        print(f"❌ Erreur critique : {e}")
-        # En cas d'erreur, on essaie de mettre le statut à 'erreur' pour débloquer l'UI
-        try:
-            supabase.table("analyses").update({"status": "erreur"}).eq("id", analysis_id).execute()
-        except:
-            pass
+        print(f"Erreur : {e}")
+        supabase.table("analyses").update({"status": "erreur"}).eq("id", analysis_id).execute()
 
 @app.post("/start-analysis/{analysis_id}")
 async def start_analysis(analysis_id: str, background_tasks: BackgroundTasks):
-    try:
-        res = supabase.table("analyses").select("file_path").eq("id", analysis_id).single().execute()
-        if not res.data:
-            raise HTTPException(status_code=404, detail="Analyse non trouvée")
-            
-        file_path = res.data['file_path']
-        background_tasks.add_task(process_analysis, analysis_id, file_path)
-        return {"message": "Analyse lancée"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    res = supabase.table("analyses").select("file_path").eq("id", analysis_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Analyse non trouvée")
+    
+    background_tasks.add_task(process_analysis, analysis_id, res.data['file_path'])
+    return {"message": "Analyse lancée"}
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-    # On récupère le port donné par l'hébergeur (Render, Railway, etc.)
-    # Si on est en local, on utilise 8000 par défaut
     port = int(os.environ.get("PORT", 8000))
-    
-    # "0.0.0.0" permet d'écouter toutes les interfaces réseau (indispensable pour Docker)
     uvicorn.run(app, host="0.0.0.0", port=port)
