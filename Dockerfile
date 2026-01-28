@@ -1,27 +1,27 @@
-# Utiliser une image Python légère
-FROM python:3.10-slim
+# On utilise l'image standard (pas la slim) qui contient déjà GCC et build-essential
+FROM python:3.10
 
-# Éviter la génération de fichiers .pyc et forcer l'affichage des logs
+# Définir les variables d'environnement
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 
 WORKDIR /app
 
-# Installer les dépendances système nécessaires pour PyMuPDF et le NLP
+# On installe seulement le strict nécessaire pour l'affichage/PDF
+# Si apt-get échoue, on continue quand même le build
 RUN apt-get update && apt-get install -y \
-    build-essential \
     libgl1-mesa-glx \
-    && rm -rf /var/lib/apt/lists/*
+    libglib2.0-0 || true
 
-# Copier uniquement les requirements d'abord pour le cache Docker
+# Gestion des dépendances Python
 COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copier le reste du code
+# Copier le projet
 COPY . .
 
-# Exposer le port de FastAPI
+# Port dynamique pour Render
 EXPOSE 8000
 
-# Lancer l'application avec Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
