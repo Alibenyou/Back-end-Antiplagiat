@@ -30,7 +30,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
 # --- Configuration IA via API ---
 # On utilise le même modèle mais hébergé chez Hugging Face
-HF_API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 def calculate_similarity(text1, text2):
     """ Envoie les textes à Hugging Face avec gestion du temps de chargement """
