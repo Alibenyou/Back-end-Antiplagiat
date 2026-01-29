@@ -34,6 +34,20 @@ HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transfo
 opts = ClientOptions(postgrest_client_timeout=60, storage_client_timeout=60)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
+def clean_for_pdf(text):
+    if not text:
+        return ""
+    # Remplace les tirets spéciaux, guillemets stylisés, etc., par leurs équivalents basiques
+    replacements = {
+        '–': '-', '—': '-', '‘': "'", '’': "'", 
+        '“': '"', '”': '"', '•': '*', '…': '...'
+    }
+    for char, rep in replacements.items():
+        text = text.replace(char, rep)
+    
+    # Encode en latin-1 et ignore ce qui reste d'illisible pour FPDF
+    return text.encode('latin-1', 'ignore').decode('latin-1')
+
 # --- Fonctions IA et Utilitaires ---
 
 def calculate_similarity(text1, text2, retries=2):
@@ -171,21 +185,41 @@ async def process_analysis(analysis_id: str, file_path: str):
         }).execute()
 
     except Exception as e:
-        print(f"Erreur globale: {e}")
-        supabase.table("analyses").update({"status": "erreur", "progress": 0}).eq("id", analysis_id).execute()
+        print(f"Erreur globale critique: {e}")
+        # On informe la DB que l'analyse a échoué
+        supabase.table("analyses").update({
+            "status": "erreur", 
+            "progress": 0,
+            "plagiarism_score": 0
+        }).eq("id", analysis_id).execute()
+        
+        # Optionnel : Envoyer une notification d'échec à l'utilisateur
+        try:
+            analysis_data = supabase.table("analyses").select("user_id").eq("id", analysis_id).single().execute()
+            if analysis_data.data:
+                supabase.table("notifications").insert({
+                    "user_id": analysis_data.data['user_id'],
+                    "title": "Échec de l'analyse ❌",
+                    "message": "Une erreur technique est survenue. Veuillez réessayer avec un autre fichier.",
+                    "is_read": False
+                }).execute()
+        except:
+            pass
 
 def generate_styled_report(analysis_id, filename, score, sources, user_text):
     pdf = FPDF()
     pdf.add_page()
     
-    # En-tête
+    # --- EN-TÊTE ---
     pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, "RAPPORT D'ANALYSE ANTI-PLAGIAT", ln=True, align="C")
+    pdf.cell(0, 10, clean_for_pdf("RAPPORT D'ANALYSE ANTI-PLAGIAT"), ln=True, align="C")
     pdf.set_font("Arial", "", 10)
-    pdf.cell(0, 10, f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True, align="C")
+    # Nettoyage de la date au cas où (tirets)
+    date_str = clean_for_pdf(f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    pdf.cell(0, 10, date_str, ln=True, align="C")
     pdf.ln(5)
 
-    # Score Global avec couleur
+    # --- SCORE GLOBAL AVEC COULEUR DYNAMIQUE ---
     color = (46, 204, 113) if score < 15 else (241, 194, 50) if score < 30 else (231, 76, 60)
     pdf.set_fill_color(*color)
     pdf.set_text_color(255, 255, 255)
@@ -193,45 +227,50 @@ def generate_styled_report(analysis_id, filename, score, sources, user_text):
     pdf.cell(0, 20, f"SCORE GLOBAL : {score}%", ln=True, align="C", fill=True)
     pdf.ln(5)
 
-    # Graphique
+    # --- GRAPHIQUE ---
     chart_buf = generate_pie_chart(score)
     pdf.image(chart_buf, x=65, y=pdf.get_y(), w=80)
     pdf.set_y(pdf.get_y() + 85)
 
+    # --- HIGHLIGHTER (LE TEXTE ORIGINAL) ---
+    pdf.set_text_color(0, 0, 0)
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Analyse du texte original :", ln=True)
+    pdf.cell(0, 10, clean_for_pdf("Analyse du texte original :"), ln=True)
     pdf.set_font("Arial", "", 10)
 
-    # On découpe le texte pour l'afficher proprement
-    # Pour chaque bloc de 500 mots, si le score de ce bloc était > 15%, on l'affiche en rouge
     words = user_text.split()
-    for i in range(0, len(words), 20):  # On traite par petites lignes
+    for i in range(0, len(words), 20):
         line = " ".join(words[i:i+20])
+        # On nettoie chaque ligne avant de l'écrire pour éviter le crash Render
+        clean_line = clean_for_pdf(line)
 
         if score > 20 and (i % 60 == 0): 
-            pdf.set_text_color(231, 76, 60) # Rouge pour le texte suspect
+            pdf.set_text_color(231, 76, 60) # Rouge pour texte suspect
             pdf.set_font("Arial", "B", 10)
         else:
-            pdf.set_text_color(0, 0, 0) # Noir pour le texte unique
+            pdf.set_text_color(0, 0, 0) # Noir
             pdf.set_font("Arial", "", 10)
             
-        pdf.write(6, line + " ")
+        pdf.write(6, clean_line + " ")
         
     pdf.ln(15)
 
-    # Sources
+    # --- SECTION SOURCES ---
     pdf.set_text_color(0, 0, 0)
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, f"Fichier : {filename}", ln=True)
+    # Nettoyage du nom du fichier
+    pdf.cell(0, 10, f"Fichier : {clean_for_pdf(filename)}", ln=True)
     pdf.ln(2)
-    pdf.cell(0, 10, "Sources similaires détectées :", ln=True)
+    pdf.cell(0, 10, clean_for_pdf("Sources similaires détectées :"), ln=True)
     
+    # Liste des sources (Top 10)
     pdf.set_font("Arial", "", 10)
-    for s in sorted(sources, key=lambda x: x['score'], reverse=True)[:10]: # Top 10 sources
-        clean_url = s['url'].encode('latin-1', 'ignore').decode('latin-1')
-        pdf.set_text_color(18, 5, 207)
-        pdf.cell(0, 8, f"- {clean_url} ({s['score']}%)", ln=True, link=s['url'])
+    for s in sorted(sources, key=lambda x: x['score'], reverse=True)[:10]:
+        display_url = clean_for_pdf(s['url'])
+        pdf.set_text_color(18, 5, 207) # Bleu
+        pdf.cell(0, 8, f"- {display_url} ({s['score']}%)", ln=True, link=s['url'])
 
+    # Sauvegarde finale
     report_name = f"temp_{analysis_id}.pdf"
     pdf.output(report_name)
     return report_name
