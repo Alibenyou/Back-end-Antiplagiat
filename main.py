@@ -7,6 +7,9 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client, ClientOptions
 from dotenv import load_dotenv
+from fpdf import FPDF
+from datetime import datetime
+
 
 load_dotenv()
 
@@ -107,25 +110,33 @@ def scrape_website(url):
 
 async def process_analysis(analysis_id: str, file_path: str):
     try:
-        # 1. Récupération du fichier
+        # --- Étape 1 : Lecture (20%) ---
+        supabase.table("analyses").update({"status": "Lecture du document...", "progress": 20}).eq("id", analysis_id).execute()
+        
         file_bin = supabase.storage.from_('fichiers_plagiat').download(file_path)
         user_text = extract_text(file_bin)
         
         if not user_text.strip():
-            supabase.table("analyses").update({"status": "termine", "plagiarism_score": 0}).eq("id", analysis_id).execute()
+            supabase.table("analyses").update({"status": "termine", "plagiarism_score": 0, "progress": 100}).eq("id", analysis_id).execute()
             return
 
-        # 2. Recherche Web
+        # --- Étape 2 : Recherche Web (50%) ---
+        supabase.table("analyses").update({"status": "Recherche de sources web...", "progress": 50}).eq("id", analysis_id).execute()
+        
         search_query = user_text[:300] 
         web_sources = search_google(search_query)
 
         max_score = 0
+        detected_sources = [] # Pour le rapport PDF
+
+        # --- Étape 3 : Comparaison IA (80%) ---
+        supabase.table("analyses").update({"status": "Analyse de similitude IA...", "progress": 80}).eq("id", analysis_id).execute()
+        
         for source in web_sources:
             link = source['link']
             web_text = scrape_website(link)
 
             if web_text:
-                # 3. Comparaison via API Hugging Face
                 similarity = calculate_similarity(user_text[:1000], web_text[:1000])
                 score = round(similarity * 100, 2)
                 
@@ -133,22 +144,97 @@ async def process_analysis(analysis_id: str, file_path: str):
                     max_score = score
 
                 if score > 15:
-                    supabase.table("analysis_results").insert({
+                    source_data = {
                         "analysis_id": analysis_id,
                         "url": link,
                         "title": source.get('title'),
                         "similarity_score": score
-                    }).execute()
+                    }
+                    supabase.table("analysis_results").insert(source_data).execute()
+                    detected_sources.append({"url": link, "score": score})
         
-        # 4. Finalisation
+        # --- Étape 4 : Génération du Rapport PDF ---
+        supabase.table("analyses").update({"status": "Génération du rapport PDF...", "progress": 90}).eq("id", analysis_id).execute()
+        
+        # On récupère le nom du fichier pour le PDF
+        res = supabase.table("analyses").select("file_name").eq("id", analysis_id).single().execute()
+        original_name = res.data['file_name']
+        
+        # Génération locale
+        pdf_local_path = generate_styled_report(analysis_id, original_name, max_score, detected_sources)
+        
+        # Upload du PDF vers Supabase Storage
+        remote_pdf_path = f"reports/report_{analysis_id}.pdf"
+        with open(pdf_local_path, "rb") as f:
+            supabase.storage.from_('fichiers_plagiat').upload(remote_pdf_path, f, {"content-type": "application/pdf"})
+        
+        # Suppression du fichier local temporaire
+        if os.path.exists(pdf_local_path):
+            os.remove(pdf_local_path)
+
+        # --- Étape 5 : Finalisation (100%) ---
         supabase.table("analyses").update({
             "status": "termine",
-            "plagiarism_score": max_score
+            "plagiarism_score": max_score,
+            "progress": 100,
+            "report_path": remote_pdf_path # On stocke le chemin du PDF
         }).eq("id", analysis_id).execute()
 
     except Exception as e:
         print(f"Erreur : {e}")
-        supabase.table("analyses").update({"status": "erreur"}).eq("id", analysis_id).execute()
+        supabase.table("analyses").update({"status": "erreur", "progress": 0}).eq("id", analysis_id).execute()
+
+
+def generate_styled_report(analysis_id, filename, score, sources):
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # --- EN-TÊTE ---
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "RAPPORT D'ANALYSE ANTI-PLAGIAT", ln=True, align="C")
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 10, f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True, align="C")
+    pdf.ln(10)
+
+    # --- JAUGE DE SCORE ---
+    # Définition de la couleur (Vert, Orange, Rouge)
+    if score < 10: color = (46, 204, 113)  # Vert
+    elif score < 25: color = (241, 194, 50) # Orange
+    else: color = (231, 76, 60)             # Rouge
+
+    pdf.set_fill_color(*color)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Arial", "B", 24)
+    pdf.cell(0, 25, f"SCORE GLOBAL : {score}%", ln=True, align="C", fill=True)
+    pdf.ln(10)
+
+    # --- DÉTAILS DU FICHIER ---
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, f"Fichier analysé : {filename}", ln=True)
+    pdf.ln(5)
+
+    # --- TABLEAU DES SOURCES ---
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Sources similaires détectées :", ln=True)
+    pdf.set_font("Arial", "", 10)
+    
+    for source in sources:
+        # source pourrait être {"url": "...", "score": 85}
+        url = source.get('url', 'Source inconnue')
+        sim = source.get('score', 0)
+        pdf.multi_cell(0, 8, f"• {url} (Similitude : {sim}%)", border=0)
+        pdf.ln(2)
+
+    # --- PIED DE PAGE ---
+    pdf.set_y(-30)
+    pdf.set_font("Arial", "I", 8)
+    pdf.cell(0, 10, "Ce rapport a été généré automatiquement par Antiplagiat IA.", align="C")
+
+    # Sauvegarde locale temporaire avant upload vers Supabase Storage
+    report_name = f"report_{analysis_id}.pdf"
+    pdf.output(report_name)
+    return report_name
 
 @app.post("/start-analysis/{analysis_id}")
 async def start_analysis(analysis_id: str, background_tasks: BackgroundTasks):

@@ -5,3 +5,4 @@ requests
 beautifulsoup4
 pymupdf
 supabase
+fpdf2==2.7.8
