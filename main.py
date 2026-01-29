@@ -215,15 +215,21 @@ def generate_styled_report(analysis_id, filename, score, sources):
     pdf.ln(5)
 
     # --- TABLEAU DES SOURCES ---
+    # --- TABLEAU DES SOURCES ---
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Sources similaires détectées :", ln=True)
+    pdf.cell(0, 10, "Sources similaires detectees :", ln=True) # Retrait de l'accent pour éviter d'autres erreurs
     pdf.set_font("Arial", "", 10)
     
     for source in sources:
-        # source pourrait être {"url": "...", "score": 85}
         url = source.get('url', 'Source inconnue')
         sim = source.get('score', 0)
-        pdf.multi_cell(0, 8, f"• {url} (Similitude : {sim}%)", border=0)
+        # On remplace le point "•" par un simple tiret "-" qui est supporté partout
+        text_source = f"- {url} (Similitude : {sim}%)"
+        
+        # On encode en 'latin-1' et on ignore les caractères bizarres pour éviter le crash
+        clean_text = text_source.encode('latin-1', 'ignore').decode('latin-1')
+        
+        pdf.multi_cell(0, 8, clean_text, border=0)
         pdf.ln(2)
 
     # --- PIED DE PAGE ---
