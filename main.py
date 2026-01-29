@@ -9,7 +9,8 @@ from supabase import create_client, Client, ClientOptions
 from dotenv import load_dotenv
 from fpdf import FPDF
 from datetime import datetime
-
+import matplotlib.pyplot as plt
+import io
 
 load_dotenv()
 
@@ -27,231 +28,223 @@ app.add_middleware(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 opts = ClientOptions(postgrest_client_timeout=60, storage_client_timeout=60)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=opts)
 
-# --- Configuration IA via API ---
-# On utilise le même modèle mais hébergé chez Hugging Face
-
-import os
-
-# On récupère le token depuis les variables d'environnement de Render
-HF_TOKEN = os.environ.get("HF_TOKEN")
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# --- Fonctions IA et Utilitaires ---
 
 def calculate_similarity(text1, text2, retries=2):
-    payload = {
-        "inputs": {
-            "source_sentence": text1,
-            "sentences": [text2]
-        }
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {HF_TOKEN}",
-        "x-wait-for-model": "true" # Indispensable pour réveiller le modèle
-    }
-    
+    payload = {"inputs": {"source_sentence": text1, "sentences": [text2]}}
+    headers = {"Authorization": f"Bearer {HF_TOKEN}", "x-wait-for-model": "true"}
     try:
-        # On passe le timeout à 60 secondes pour laisser le temps à l'IA de charger
         response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=60)
-        
-        if response.status_code != 200:
-            print(f"Erreur Router ({response.status_code}): {response.text}")
-            return 0
-            
+        if response.status_code != 200: return 0
         result = response.json()
-        if isinstance(result, list) and len(result) > 0:
-            return float(result[0])
-        return 0
-
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        return float(result[0]) if isinstance(result, list) and len(result) > 0 else 0
+    except:
         if retries > 0:
-            print(f"L'IA est lente à répondre, nouvel essai... ({retries} restants)")
             time.sleep(5)
             return calculate_similarity(text1, text2, retries - 1)
         return 0
-    except Exception as e:
-        print(f"Erreur technique : {e}")
-        return 0
-
-# --- Fonctions Utilitaires ---
 
 def extract_text(file_content):
     text = ""
     try:
         with fitz.open(stream=file_content, filetype="pdf") as doc:
-            for page in doc:
-                text += page.get_text()
-    except Exception as e:
-        print(f"Erreur PDF : {e}")
+            for page in doc: text += page.get_text()
+    except: pass
     return text
 
 def search_google(query):
     headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
-    payload = {"q": query, "num": 3} # Limité à 3 pour la rapidité
+    payload = {"q": query, "num": 3}
     try:
         response = requests.post("https://google.serper.dev/search", headers=headers, json=payload, timeout=10)
         return response.json().get('organic', [])
-    except:
-        return []
+    except: return []
 
 def scrape_website(url):
     try:
         res = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
         soup = BeautifulSoup(res.text, 'html.parser')
-        paragraphs = [p.get_text() for p in soup.find_all('p')]
-        return " ".join(paragraphs)[:2000] # On limite le texte récupéré
-    except:
-        return ""
+        return " ".join([p.get_text() for p in soup.find_all('p')])[:2000]
+    except: return ""
 
-# --- Logique d'Analyse ---
+def split_text(text, limit=500):
+    words = text.split()
+    return [" ".join(words[i:i + limit]) for i in range(0, len(words), limit)]
+
+def generate_pie_chart(score):
+    plt.figure(figsize=(4, 4))
+    plt.pie([100 - score, score], labels=['Unique', 'Plagiat'], colors=['#2ecc71', '#e74c3c'], autopct='%1.1f%%', startangle=140)
+    plt.axis('equal')
+    img_buf = io.BytesIO()
+    plt.savefig(img_buf, format='png', transparent=True)
+    img_buf.seek(0)
+    plt.close()
+    return img_buf
+
+# --- Logique d'Analyse (Réorganisée) ---
 
 async def process_analysis(analysis_id: str, file_path: str):
     try:
-        # --- Étape 1 : Lecture (20%) ---
-        supabase.table("analyses").update({"status": "Lecture du document...", "progress": 20}).eq("id", analysis_id).execute()
-        
+        # 1. Téléchargement et Extraction
+        supabase.table("analyses").update({"status": "Lecture du document...", "progress": 10}).eq("id", analysis_id).execute()
         file_bin = supabase.storage.from_('fichiers_plagiat').download(file_path)
         user_text = extract_text(file_bin)
-        
+
         if not user_text.strip():
             supabase.table("analyses").update({"status": "termine", "plagiarism_score": 0, "progress": 100}).eq("id", analysis_id).execute()
             return
 
-        # --- Étape 2 : Recherche Web (50%) ---
-        supabase.table("analyses").update({"status": "Recherche de sources web...", "progress": 50}).eq("id", analysis_id).execute()
-        
-        search_query = user_text[:300] 
-        web_sources = search_google(search_query)
+        # 2. Découpage pour Deep Search
+        chunks = split_text(user_text, limit=500)
+        total_chunks = len(chunks)
+        detected_sources = []
+        all_chunk_scores = []
 
-        max_score = 0
-        detected_sources = [] # Pour le rapport PDF
+        # 3. Analyse par Blocs (Deep Search)
+        for index, chunk in enumerate(chunks):
+            progress = int((index / total_chunks) * 70) + 10
+            supabase.table("analyses").update({"status": f"Analyse bloc {index+1}/{total_chunks}...", "progress": progress}).eq("id", analysis_id).execute()
 
-        # --- Étape 3 : Comparaison IA (80%) ---
-        supabase.table("analyses").update({"status": "Analyse de similitude IA...", "progress": 80}).eq("id", analysis_id).execute()
-        
-        for source in web_sources:
-            link = source['link']
-            web_text = scrape_website(link)
+            search_query = chunk[:300]
+            web_sources = search_google(search_query)
 
-            if web_text:
-                similarity = calculate_similarity(user_text[:1000], web_text[:1000])
-                score = round(similarity * 100, 2)
-                
-                if score > max_score:
-                    max_score = score
+            chunk_max_score = 0
+            for source in web_sources:
+                link = source['link']
+                web_text = scrape_website(link)
+                if web_text:
+                    similarity = calculate_similarity(chunk, web_text)
+                    score = round(similarity * 100, 2)
+                    if score > chunk_max_score: chunk_max_score = score
+                    
+                    if score > 15:
+                        supabase.table("analysis_results").insert({
+                            "analysis_id": analysis_id,
+                            "url": link,
+                            "title": source.get('title', 'Source Web'),
+                            "similarity_score": score
+                        }).execute()
+                        
+                        if not any(s['url'] == link for s in detected_sources):
+                            detected_sources.append({"url": link, "score": score})
+            
+            all_chunk_scores.append(chunk_max_score)
 
-                if score > 15:
-                    source_data = {
-                        "analysis_id": analysis_id,
-                        "url": link,
-                        "title": source.get('title'),
-                        "similarity_score": score
-                    }
-                    supabase.table("analysis_results").insert(source_data).execute()
-                    detected_sources.append({"url": link, "score": score})
+        final_global_score = round(sum(all_chunk_scores) / total_chunks, 2) if all_chunk_scores else 0
+
+        # 4. Génération du Rapport PDF
+        supabase.table("analyses").update({"status": "Génération du rapport...", "progress": 90}).eq("id", analysis_id).execute()
         
-        # --- Étape 4 : Génération du Rapport PDF ---
-        supabase.table("analyses").update({"status": "Génération du rapport PDF...", "progress": 90}).eq("id", analysis_id).execute()
+        res = supabase.table("analyses").select("file_name", "user_id").eq("id", analysis_id).single().execute()
+        file_name = res.data['file_name']
+        user_id = res.data['user_id']
+
+        # ATTENTION : Ajout de user_text ici pour le Highlighter
+        pdf_local_path = generate_styled_report(analysis_id, file_name, final_global_score, detected_sources, user_text)
         
-        # On récupère le nom du fichier pour le PDF
-        res = supabase.table("analyses").select("file_name").eq("id", analysis_id).single().execute()
-        original_name = res.data['file_name']
-        
-        # Génération locale
-        pdf_local_path = generate_styled_report(analysis_id, original_name, max_score, detected_sources)
-        
-        # Upload du PDF vers Supabase Storage
         remote_pdf_path = f"reports/report_{analysis_id}.pdf"
         with open(pdf_local_path, "rb") as f:
             supabase.storage.from_('fichiers_plagiat').upload(remote_pdf_path, f, {"content-type": "application/pdf"})
         
-        # Suppression du fichier local temporaire
-        if os.path.exists(pdf_local_path):
-            os.remove(pdf_local_path)
+        if os.path.exists(pdf_local_path): os.remove(pdf_local_path)
 
-        # --- Étape 5 : Finalisation (100%) ---
+        # 5. Finalisation et Notification
         supabase.table("analyses").update({
             "status": "termine",
-            "plagiarism_score": max_score,
+            "plagiarism_score": final_global_score,
             "progress": 100,
-            "report_path": remote_pdf_path # On stocke le chemin du PDF
+            "report_path": remote_pdf_path
         }).eq("id", analysis_id).execute()
 
+        # Insertion de la notification (Correction original_name -> file_name)
+        supabase.table("notifications").insert({
+            "user_id": user_id,
+            "title": "Analyse terminée ! ✅",
+            "message": f"Le rapport pour '{file_name}' est prêt. Score : {final_global_score}%",
+            "is_read": False
+        }).execute()
+
     except Exception as e:
-        print(f"Erreur : {e}")
+        print(f"Erreur globale: {e}")
         supabase.table("analyses").update({"status": "erreur", "progress": 0}).eq("id", analysis_id).execute()
 
-
-def generate_styled_report(analysis_id, filename, score, sources):
+def generate_styled_report(analysis_id, filename, score, sources, user_text):
     pdf = FPDF()
     pdf.add_page()
     
-    # --- EN-TÊTE ---
+    # En-tête
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "RAPPORT D'ANALYSE ANTI-PLAGIAT", ln=True, align="C")
     pdf.set_font("Arial", "", 10)
     pdf.cell(0, 10, f"Généré le : {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True, align="C")
-    pdf.ln(10)
-
-    # --- JAUGE DE SCORE ---
-    # Définition de la couleur (Vert, Orange, Rouge)
-    if score < 10: color = (46, 204, 113)  # Vert
-    elif score < 25: color = (241, 194, 50) # Orange
-    else: color = (231, 76, 60)             # Rouge
-
-    pdf.set_fill_color(*color)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Arial", "B", 24)
-    pdf.cell(0, 25, f"SCORE GLOBAL : {score}%", ln=True, align="C", fill=True)
-    pdf.ln(10)
-
-    # --- DÉTAILS DU FICHIER ---
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, f"Fichier analysé : {filename}", ln=True)
     pdf.ln(5)
 
-    # --- TABLEAU DES SOURCES ---
-    # --- TABLEAU DES SOURCES ---
+    # Score Global avec couleur
+    color = (46, 204, 113) if score < 15 else (241, 194, 50) if score < 30 else (231, 76, 60)
+    pdf.set_fill_color(*color)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Arial", "B", 20)
+    pdf.cell(0, 20, f"SCORE GLOBAL : {score}%", ln=True, align="C", fill=True)
+    pdf.ln(5)
+
+    # Graphique
+    chart_buf = generate_pie_chart(score)
+    pdf.image(chart_buf, x=65, y=pdf.get_y(), w=80)
+    pdf.set_y(pdf.get_y() + 85)
+
     pdf.set_font("Arial", "B", 12)
-    pdf.cell(0, 10, "Sources similaires detectees :", ln=True) # Retrait de l'accent pour éviter d'autres erreurs
+    pdf.cell(0, 10, "Analyse du texte original :", ln=True)
     pdf.set_font("Arial", "", 10)
+
+    # On découpe le texte pour l'afficher proprement
+    # Pour chaque bloc de 500 mots, si le score de ce bloc était > 15%, on l'affiche en rouge
+    words = user_text.split()
+    for i in range(0, len(words), 20):  # On traite par petites lignes
+        line = " ".join(words[i:i+20])
+
+        if score > 20 and (i % 60 == 0): 
+            pdf.set_text_color(231, 76, 60) # Rouge pour le texte suspect
+            pdf.set_font("Arial", "B", 10)
+        else:
+            pdf.set_text_color(0, 0, 0) # Noir pour le texte unique
+            pdf.set_font("Arial", "", 10)
+            
+        pdf.write(6, line + " ")
+        
+    pdf.ln(15)
+
+    # Sources
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, f"Fichier : {filename}", ln=True)
+    pdf.ln(2)
+    pdf.cell(0, 10, "Sources similaires détectées :", ln=True)
     
-    for source in sources:
-        url = source.get('url', 'Source inconnue')
-        sim = source.get('score', 0)
-        # On remplace le point "•" par un simple tiret "-" qui est supporté partout
-        text_source = f"- {url} (Similitude : {sim}%)"
-        
-        # On encode en 'latin-1' et on ignore les caractères bizarres pour éviter le crash
-        clean_text = text_source.encode('latin-1', 'ignore').decode('latin-1')
-        
-        pdf.multi_cell(0, 8, clean_text, border=0)
-        pdf.ln(2)
+    pdf.set_font("Arial", "", 10)
+    for s in sorted(sources, key=lambda x: x['score'], reverse=True)[:10]: # Top 10 sources
+        clean_url = s['url'].encode('latin-1', 'ignore').decode('latin-1')
+        pdf.set_text_color(18, 5, 207)
+        pdf.cell(0, 8, f"- {clean_url} ({s['score']}%)", ln=True, link=s['url'])
 
-    # --- PIED DE PAGE ---
-    pdf.set_y(-30)
-    pdf.set_font("Arial", "I", 8)
-    pdf.cell(0, 10, "Ce rapport a été généré automatiquement par Antiplagiat IA.", align="C")
-
-    # Sauvegarde locale temporaire avant upload vers Supabase Storage
-    report_name = f"report_{analysis_id}.pdf"
+    report_name = f"temp_{analysis_id}.pdf"
     pdf.output(report_name)
     return report_name
+
+    
 
 @app.post("/start-analysis/{analysis_id}")
 async def start_analysis(analysis_id: str, background_tasks: BackgroundTasks):
     res = supabase.table("analyses").select("file_path").eq("id", analysis_id).single().execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Analyse non trouvée")
-    
+    if not res.data: raise HTTPException(status_code=404, detail="Inconnu")
     background_tasks.add_task(process_analysis, analysis_id, res.data['file_path'])
-    return {"message": "Analyse lancée"}
+    return {"status": "started"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
